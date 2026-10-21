@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import io
 import os
 
@@ -185,13 +186,23 @@ with tab_scan:
                 st.markdown("\n".join(f"{i}. {step}" for i, step in enumerate(advice.steps, 1)))
                 st.info(f"常見錯誤：{advice.item.mistake}")
             else:
+                obs = advice.observation
+                if advice.unlisted:
+                    label = f"AI 認出這是「{html.escape(obs.object_name)}」"
+                    hint = "目前的分類表還沒有這個品項，所以不提供分類建議。"
+                else:
+                    label = html.escape(obs.description) if obs.description else "照片中的物品看不太清楚"
+                    hint = "AI 沒辦法從這張照片認出物品。"
                 st.markdown(
                     f"""<div class="bin-card" style="background:{BIN_COLORS['trash']}">
-                          <p class="label">{advice.observation.description or "看不出是什麼"}</p>
-                          <p class="name">無法判斷</p>
+                          <p class="label">{label}</p>
+                          <p class="name">{advice.bin_name}</p>
+                          <p class="hint">{hint}</p>
                         </div>""",
                     unsafe_allow_html=True,
                 )
+                if guess:
+                    st.caption("這次沒有標準答案，所以不列入猜對率。")
                 st.markdown("\n".join(f"- {step}" for step in advice.steps))
 
     st.caption("各縣市的回收規定可能不同，實際做法請以當地環保局公告為準。")

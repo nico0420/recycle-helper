@@ -15,6 +15,8 @@ class Observation:
     item_id: str
     confidence: float
     description: str = ""
+    object_name: str = ""
+    photo_clear: bool = True
     has_liquid: bool = False
     has_food_residue: bool = False
     has_label: bool = False
@@ -30,6 +32,7 @@ class Advice:
     steps: tuple[str, ...]
     warnings: tuple[str, ...] = field(default_factory=tuple)
     low_confidence: bool = False
+    unlisted: bool = False
 
     @property
     def recognized(self) -> bool:
@@ -80,6 +83,8 @@ def parse_observation(raw: str | dict) -> Observation:
         item_id=item_id,
         confidence=confidence,
         description=str(data.get("description", "")).strip()[:200],
+        object_name=str(data.get("object_name", "")).strip()[:40],
+        photo_clear=flag("photo_clear") if "photo_clear" in data else True,
         has_liquid=flag("has_liquid"),
         has_food_residue=flag("has_food_residue"),
         has_label=flag("has_label"),
@@ -90,12 +95,28 @@ def parse_observation(raw: str | dict) -> Observation:
 def build_advice(obs: Observation) -> Advice:
     item = get_item(obs.item_id)
     if item is None:
+        if obs.photo_clear and obs.object_name:
+            # The model saw the object clearly; it just isn't one we have rules for.
+            return Advice(
+                observation=obs,
+                item=None,
+                bin=None,
+                bin_name="分類表沒有收錄",
+                steps=(
+                    "詢問當地清潔隊或環保局該怎麼處理",
+                    "或到「分類表」分頁找材質相近的品項參考",
+                ),
+                unlisted=True,
+            )
         return Advice(
             observation=obs,
             item=None,
             bin=None,
-            bin_name="無法判斷",
-            steps=("換個角度、光線充足時再拍一次", "或對照下方的分類表自行判斷"),
+            bin_name="看不清楚",
+            steps=(
+                "把物品放在單純的背景前，讓它佔滿大半個畫面",
+                "在光線充足的地方，換個角度再拍一次",
+            ),
         )
 
     warnings: list[str] = []
@@ -107,6 +128,8 @@ def build_advice(obs: Observation) -> Advice:
         warnings.append("瓶身還有標籤，記得撕下來。")
     if obs.is_broken and item.id == "glass_bottle":
         warnings.append("玻璃已經破了，請用報紙包好並寫上「碎玻璃」。")
+    if obs.is_broken and item.id == "lighting":
+        warnings.append("燈管已經破了，請小心碎片，用厚紙或報紙包好再交給回收車。")
 
     return Advice(
         observation=obs,

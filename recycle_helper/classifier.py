@@ -17,8 +17,12 @@ PROMPT = f"""你是資源回收分類助理。請看照片中最主要的那一�
 {describe_for_model()}
 
 只根據照片中看得到的東西判斷，不要猜測看不到的部分。
-照片模糊、物品太小，或有多件不同物品難以判斷時，選 {UNKNOWN_ID} 並降低 confidence。
-description 用繁體中文一句話描述你看到的物品，不超過 30 字。"""
+
+- object_name：用繁體中文寫出這是什麼東西，例如「眼鏡」「寶特瓶」，不超過 10 字。看不出來就留空。
+- photo_clear：照片是否清楚到足以認出物品。模糊、太暗、物品太小或被遮住時填 false。
+- 物品看得清楚、但不屬於清單中任何一項時（例如眼鏡、雨傘），選 {UNKNOWN_ID}，photo_clear 填 true，並寫出 object_name。
+- 照片不清楚，或有多件不同物品難以判斷主角時，選 {UNKNOWN_ID}，photo_clear 填 false，並降低 confidence。
+- description：用繁體中文一句話描述你看到的物品，不超過 30 字。"""
 
 RESPONSE_SCHEMA = {
     "type": "object",
@@ -26,6 +30,8 @@ RESPONSE_SCHEMA = {
         "item_id": {"type": "string", "enum": item_ids() + [UNKNOWN_ID]},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
         "description": {"type": "string"},
+        "object_name": {"type": "string"},
+        "photo_clear": {"type": "boolean"},
         "has_liquid": {"type": "boolean"},
         "has_food_residue": {"type": "boolean"},
         "has_label": {"type": "boolean"},
@@ -35,6 +41,8 @@ RESPONSE_SCHEMA = {
         "item_id",
         "confidence",
         "description",
+        "object_name",
+        "photo_clear",
         "has_liquid",
         "has_food_residue",
         "has_label",

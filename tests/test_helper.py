@@ -188,3 +188,63 @@ def test_stats_track_guesses_and_misses():
 
 def test_stats_accuracy_none_without_guesses():
     assert Stats().accuracy is None
+
+
+# Two kinds of "not recognized"
+
+def test_clear_photo_of_unlisted_item():
+    obs = parse_observation({"item_id": "unknown", "confidence": 0.9, "object_name": "眼鏡", "photo_clear": True})
+    advice = build_advice(obs)
+    assert advice.unlisted
+    assert advice.bin_name == "分類表沒有收錄"
+    assert any("清潔隊" in step for step in advice.steps)
+    assert not any("再拍" in step for step in advice.steps)
+
+
+def test_unclear_photo_suggests_retake():
+    obs = parse_observation({"item_id": "unknown", "confidence": 0.2, "object_name": "", "photo_clear": False})
+    advice = build_advice(obs)
+    assert not advice.unlisted
+    assert advice.bin_name == "看不清楚"
+    assert any("再拍" in step for step in advice.steps)
+
+
+def test_unclear_flag_wins_even_with_a_name():
+    advice = build_advice(Observation(item_id=UNKNOWN_ID, confidence=0.3, object_name="杯子", photo_clear=False))
+    assert advice.bin_name == "看不清楚"
+
+
+def test_reply_without_photo_clear_is_treated_as_clear():
+    assert parse_observation({"item_id": "paper", "confidence": 0.9}).photo_clear is True
+
+
+def test_unlisted_items_do_not_count_toward_guess_accuracy():
+    stats = Stats()
+    glasses = build_advice(Observation(item_id=UNKNOWN_ID, confidence=0.9, object_name="眼鏡"))
+    stats.add(glasses, None)
+    assert stats.accuracy is None
+
+
+def test_schema_requires_new_fields():
+    assert "object_name" in RESPONSE_SCHEMA["required"]
+    assert "photo_clear" in RESPONSE_SCHEMA["required"]
+
+
+# New catalog items
+
+@pytest.mark.parametrize("item_id, bin_id", [
+    ("lighting", "special"),
+    ("electronics", "recycle"),
+    ("disc", "recycle"),
+    ("plastic_bag", "recycle"),
+    ("clothing", "recycle"),
+    ("ceramic", "trash"),
+    ("medicine", "trash"),
+])
+def test_new_items_have_expected_bins(item_id, bin_id):
+    assert get_item(item_id).bin == bin_id
+
+
+def test_broken_lamp_warning():
+    advice = build_advice(Observation(item_id="lighting", confidence=0.9, is_broken=True))
+    assert any("碎片" in w for w in advice.warnings)
