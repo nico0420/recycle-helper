@@ -56,50 +56,106 @@ class Classifier(Protocol):
 
 
 class ClassifierError(RuntimeError):
-    """Identification failed. The message is safe to show to the person."""
+    """Identification failed.
+
+    The message is short, plain Chinese and safe to show to anyone.
+    `detail` keeps the original technical error for troubleshooting.
+    """
+
+    def __init__(self, message: str, detail: str = "", busy: bool = False):
+        super().__init__(message)
+        self.detail = detail
+        self.busy = busy
+
+
+# Tried in order when the chosen model is overloaded.
+BACKUP_MODELS = ("gemini-3.5-flash-lite", "gemini-3.1-flash-lite")
+RETRY_WAIT_SECONDS = 1.5
 
 
 class GeminiClassifier:
-    def __init__(self, api_key: str, model: str = DEFAULT_MODEL, client=None):
+    def __init__(
+        self,
+        api_key: str,
+        model: str = DEFAULT_MODEL,
+        backups: tuple[str, ...] = BACKUP_MODELS,
+        client=None,
+        sleep=None,
+    ):
         if client is None:
             from google import genai
 
             client = genai.Client(api_key=api_key)
+        if sleep is None:
+            import time
+
+            sleep = time.sleep
         self._client = client
+        self._sleep = sleep
         self.model = model
+        self.backups = tuple(m for m in dict.fromkeys(backups) if m != model)
 
     def identify(self, image: bytes, mime_type: str) -> Observation:
+        return self.identify_detailed(image, mime_type)[0]
+
+    def identify_detailed(self, image: bytes, mime_type: str) -> tuple[Observation, str]:
+        """Like identify, and also says which model answered."""
+        # When Google is overloaded: wait and retry the chosen model once, then try the backups.
+        attempts = [self.model, self.model, *self.backups]
+        last_exc: Exception | None = None
+
+        for index, model in enumerate(attempts):
+            if index == 1:
+                self._sleep(RETRY_WAIT_SECONDS)
+            try:
+                response = self._call(model, image, mime_type)
+            except Exception as exc:  # network, quota, bad key, unknown model, overload
+                if _is_busy(exc):
+                    last_exc = exc
+                    continue
+                raise _to_error(exc) from exc
+
+            text = getattr(response, "text", None)
+            if not text:
+                raise ClassifierError("AI 沒有回傳結果，可能是照片被安全機制擋下。請換一張照片再試。")
+            return parse_observation(text), model
+
+        raise _to_error(last_exc) from last_exc
+
+    def _call(self, model: str, image: bytes, mime_type: str):
         from google.genai import types
 
-        try:
-            response = self._client.models.generate_content(
-                model=self.model,
-                contents=[types.Part.from_bytes(data=image, mime_type=mime_type), PROMPT],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_json_schema=RESPONSE_SCHEMA,
-                    temperature=0.1,
-                ),
-            )
-        except Exception as exc:  # network, quota, bad key, unknown model
-            raise ClassifierError(_explain(exc)) from exc
-
-        text = getattr(response, "text", None)
-        if not text:
-            raise ClassifierError("AI 沒有回傳結果，可能是照片被安全機制擋下。請換一張照片再試。")
-        return parse_observation(text)
+        return self._client.models.generate_content(
+            model=model,
+            contents=[types.Part.from_bytes(data=image, mime_type=mime_type), PROMPT],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_json_schema=RESPONSE_SCHEMA,
+                temperature=0.1,
+            ),
+        )
 
 
-def _explain(exc: Exception) -> str:
-    message = str(exc)
-    lowered = message.lower()
+def _is_busy(exc: Exception) -> bool:
+    """Google is temporarily overloaded (HTTP 503), so trying again or elsewhere may work."""
+    lowered = str(exc).lower()
+    return any(s in lowered for s in ("503", "unavailable", "overloaded", "high demand"))
+
+
+def _to_error(exc: Exception | None) -> ClassifierError:
+    detail = str(exc or "")[:2000]
+    lowered = detail.lower()
+    if exc is not None and _is_busy(exc):
+        return ClassifierError("Google 的 AI 伺服器現在太忙，請過一會兒再試。", detail, busy=True)
     if "api key" in lowered or "permission" in lowered or "401" in lowered or "403" in lowered:
-        return "API 金鑰無效或沒有權限。請確認 GEMINI_API_KEY 設定正確。"
+        return ClassifierError("API 金鑰無效或沒有權限。請確認 GEMINI_API_KEY 設定正確。", detail)
     if "429" in lowered or "quota" in lowered or "resource_exhausted" in lowered:
-        return "已達到 API 使用上限，請稍後再試，或先改用示範模式。"
+        return ClassifierError("今天的 AI 使用次數已達上限，請稍後再試，或先改用示範模式。", detail, busy=True)
     if "404" in lowered or "not found" in lowered:
-        return "找不到指定的模型。請確認 GEMINI_MODEL 設定的名稱是否正確。"
-    return f"呼叫 AI 時發生錯誤：{message[:160]}"
+        return ClassifierError("找不到指定的模型。請確認 GEMINI_MODEL 設定的名稱是否正確。", detail)
+    if "timeout" in lowered or "timed out" in lowered:
+        return ClassifierError("AI 太久沒有回應，請再試一次。", detail, busy=True)
+    return ClassifierError("AI 暫時無法辨識，請再試一次。", detail)
 
 
 @dataclass(frozen=True)

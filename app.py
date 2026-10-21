@@ -55,6 +55,14 @@ def gemini_classifier(api_key: str, model: str) -> GeminiClassifier:
     return GeminiClassifier(api_key=api_key, model=model)
 
 
+def readable(data: bytes) -> bool:
+    try:
+        Image.open(io.BytesIO(data)).verify()
+        return True
+    except Exception:
+        return False
+
+
 def shrink(data: bytes, max_side: int = 1280) -> tuple[bytes, str]:
     """Rotate per EXIF, cap the size, and re-encode as JPEG to keep requests small."""
     try:
@@ -132,6 +140,10 @@ with tab_scan:
             sample = next(s for s in samples if s.title == sample_choice)
             image_bytes, source_key = sample.path.read_bytes(), f"sample-{sample.id}"
 
+    if image_bytes is not None and not readable(image_bytes):
+        st.warning("讀不了這張照片，請改用 JPG 或 PNG 格式。")
+        image_bytes = None
+
     if image_bytes is None:
         st.caption("選好照片後，這裡會顯示辨識結果。")
     else:
@@ -152,19 +164,38 @@ with tab_scan:
         label = "看答案" if guess_mode else "開始辨識"
         if st.button(label, type="primary", disabled=not ready, key=f"run-{source_key}"):
             classifier = gemini_classifier(api_key, model) if mode == "AI 辨識" else demo_classifier()
+            note = None
             try:
                 with st.spinner("辨識中…"):
                     if mode == "AI 辨識":
                         data, mime = shrink(image_bytes)
+                        try:
+                            obs, used_model = classifier.identify_detailed(data, mime)
+                            if used_model != model:
+                                note = f"{model} 目前太忙，這次由 {used_model} 回答。"
+                        except (ClassifierError, ParseError):
+                            # A built-in sample always has a prepared answer, so a demo never stalls.
+                            if not source_key.startswith("sample-"):
+                                raise
+                            obs = demo_classifier().identify(image_bytes, "image/png")
+                            note = "AI 暫時無法連線，這次顯示預先準備的結果。"
                     else:
-                        data, mime = image_bytes, "image/png"
-                    advice = build_advice(classifier.identify(data, mime))
-            except (ClassifierError, ParseError) as exc:
+                        obs = classifier.identify(image_bytes, "image/png")
+                    advice = build_advice(obs)
+            except ClassifierError as exc:
                 st.session_state.result = None
-                st.error(str(exc))
+                (st.warning if exc.busy else st.error)(str(exc))
+                if exc.detail:
+                    with st.expander("技術細節"):
+                        st.code(exc.detail, language=None)
+            except ParseError as exc:
+                st.session_state.result = None
+                st.warning("AI 回覆的格式不對，請再試一次。")
+                with st.expander("技術細節"):
+                    st.code(str(exc), language=None)
             else:
                 st.session_state.stats.add(advice, guess if advice.recognized else None)
-                st.session_state.result = {"key": source_key, "advice": advice, "guess": guess}
+                st.session_state.result = {"key": source_key, "advice": advice, "guess": guess, "note": note}
 
         result = st.session_state.result
         if result and result["key"] == source_key:
@@ -194,6 +225,8 @@ with tab_scan:
                 if mode == "示範模式":
                     caption += "　（示範模式：預先準備的結果）"
                 st.caption(caption)
+                if result.get("note"):
+                    st.info(result["note"])
                 if advice.low_confidence:
                     st.warning("AI 不太確定這個判斷，建議換個角度再拍一次，或對照分類表確認。")
 
@@ -222,6 +255,8 @@ with tab_scan:
                 if guess:
                     st.caption("這次沒有標準答案，所以不列入猜對率。")
                 st.markdown("\n".join(f"- {step}" for step in advice.steps))
+                if result.get("note"):
+                    st.info(result["note"])
 
     st.caption("各縣市的回收規定可能不同，實際做法請以當地環保局公告為準。")
 

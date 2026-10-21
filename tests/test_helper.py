@@ -152,12 +152,13 @@ def test_gemini_classifier_sends_image_and_schema():
     ("401 API key not valid", "金鑰"),
     ("429 RESOURCE_EXHAUSTED", "上限"),
     ("404 models/foo is not found", "模型"),
-    ("connection reset", "錯誤"),
+    ("connection reset", "再試一次"),
 ])
 def test_gemini_errors_are_explained(message, expected):
     client, _ = _fake_client(error=RuntimeError(message))
-    with pytest.raises(ClassifierError, match=expected):
-        GeminiClassifier(api_key="x", client=client).identify(b"img", "image/jpeg")
+    with pytest.raises(ClassifierError, match=expected) as info:
+        GeminiClassifier(api_key="x", client=client, sleep=lambda s: None).identify(b"img", "image/jpeg")
+    assert info.value.detail == message
 
 
 def test_gemini_empty_reply_is_an_error():
@@ -248,3 +249,85 @@ def test_new_items_have_expected_bins(item_id, bin_id):
 def test_broken_lamp_warning():
     advice = build_advice(Observation(item_id="lighting", confidence=0.9, is_broken=True))
     assert any("碎片" in w for w in advice.warnings)
+
+
+
+# Overload: retry, backups, and never showing raw error text
+
+def _reply(item_id="metal_can"):
+    return json.dumps({"item_id": item_id, "confidence": 0.9, "description": "", "object_name": "",
+                       "photo_clear": True, "has_liquid": False, "has_food_residue": False,
+                       "has_label": False, "is_broken": False})
+
+
+BUSY = "503 UNAVAILABLE. {'error': {'code': 503, 'message': 'This model is currently experiencing high demand.'}}"
+
+
+def _scripted_client(outcomes):
+    """Each call takes the next outcome: an exception to raise, or reply text."""
+    calls = []
+
+    def generate_content(**kwargs):
+        calls.append(kwargs["model"])
+        outcome = outcomes[min(len(calls) - 1, len(outcomes) - 1)]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return SimpleNamespace(text=outcome)
+
+    return SimpleNamespace(models=SimpleNamespace(generate_content=generate_content)), calls
+
+
+def test_busy_then_ok_retries_same_model_after_waiting():
+    client, calls = _scripted_client([RuntimeError(BUSY), _reply()])
+    waits = []
+    clf = GeminiClassifier(api_key="x", model="gemini-3.5-flash-lite", client=client, sleep=waits.append)
+    obs, used = clf.identify_detailed(b"img", "image/jpeg")
+    assert obs.item_id == "metal_can"
+    assert calls == ["gemini-3.5-flash-lite", "gemini-3.5-flash-lite"]
+    assert used == "gemini-3.5-flash-lite"
+    assert waits == [1.5]
+
+
+def test_still_busy_moves_to_backup_model():
+    client, calls = _scripted_client([RuntimeError(BUSY), RuntimeError(BUSY), _reply()])
+    clf = GeminiClassifier(api_key="x", model="gemini-3.5-flash-lite", client=client, sleep=lambda s: None)
+    obs, used = clf.identify_detailed(b"img", "image/jpeg")
+    assert calls == ["gemini-3.5-flash-lite", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
+    assert used == "gemini-3.1-flash-lite"
+
+
+def test_backups_skip_the_chosen_model():
+    clf = GeminiClassifier(api_key="x", model="gemini-3.8-flash", client=object(), sleep=lambda s: None)
+    assert clf.backups == ("gemini-3.5-flash-lite", "gemini-3.1-flash-lite")
+    clf = GeminiClassifier(api_key="x", model="gemini-3.5-flash-lite", client=object(), sleep=lambda s: None)
+    assert clf.backups == ("gemini-3.1-flash-lite",)
+
+
+def test_all_busy_gives_short_message_and_keeps_detail():
+    client, calls = _scripted_client([RuntimeError(BUSY)])
+    clf = GeminiClassifier(api_key="x", model="gemini-3.5-flash-lite", client=client, sleep=lambda s: None)
+    with pytest.raises(ClassifierError) as info:
+        clf.identify(b"img", "image/jpeg")
+    err = info.value
+    assert len(calls) == 3
+    assert err.busy
+    assert "太忙" in str(err)
+    assert "{" not in str(err) and "503" not in str(err)
+    assert "high demand" in err.detail
+
+
+def test_non_busy_error_is_not_retried():
+    client, calls = _scripted_client([RuntimeError("401 API key not valid")])
+    with pytest.raises(ClassifierError):
+        GeminiClassifier(api_key="x", client=client, sleep=lambda s: None).identify(b"img", "image/jpeg")
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("raw", [BUSY, "401 API key not valid", "429 quota", "boom {'x': 1}", "Request timed out"])
+def test_messages_never_contain_raw_text(raw):
+    client, _ = _scripted_client([RuntimeError(raw)])
+    with pytest.raises(ClassifierError) as info:
+        GeminiClassifier(api_key="x", client=client, sleep=lambda s: None).identify(b"img", "image/jpeg")
+    message = str(info.value)
+    assert "{" not in message and "'" not in message
+    assert all(ord(ch) > 127 or ch in " .,_" or ch.isalnum() for ch in message)
