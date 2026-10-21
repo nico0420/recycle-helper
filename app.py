@@ -57,7 +57,10 @@ def gemini_classifier(api_key: str, model: str) -> GeminiClassifier:
 
 def shrink(data: bytes, max_side: int = 1280) -> tuple[bytes, str]:
     """Rotate per EXIF, cap the size, and re-encode as JPEG to keep requests small."""
-    image = ImageOps.exif_transpose(Image.open(io.BytesIO(data))).convert("RGB")
+    try:
+        image = ImageOps.exif_transpose(Image.open(io.BytesIO(data))).convert("RGB")
+    except Exception as exc:
+        raise ClassifierError("讀不了這張照片，請改用 JPG 或 PNG 格式。") from exc
     image.thumbnail((max_side, max_side))
     out = io.BytesIO()
     image.save(out, format="JPEG", quality=88)
@@ -94,20 +97,35 @@ with tab_scan:
     source_key = None
 
     if mode == "AI 辨識":
+        def picked(source: str):
+            return lambda: st.session_state.update(last_source=source)
+
         upload_tab, camera_tab, sample_tab = st.tabs(["上傳照片", "拍照", "範例照片"])
         with upload_tab:
-            uploaded = st.file_uploader("選一張回收物的照片", type=["jpg", "jpeg", "png", "webp", "heic"])
+            uploaded = st.file_uploader(
+                "選一張回收物的照片", type=["jpg", "jpeg", "png", "webp"], on_change=picked("upload")
+            )
         with camera_tab:
-            shot = st.camera_input("對準要丟的東西")
+            shot = st.camera_input("對準要丟的東西", on_change=picked("camera"))
         with sample_tab:
-            sample_choice = st.radio("或用範例照片試試", [s.title for s in samples], index=None)
+            sample_choice = st.radio(
+                "或用範例照片試試", [s.title for s in samples], index=None, on_change=picked("sample")
+            )
+
+        # Use the photo the person picked most recently; fall back to any that is still set.
+        available = {}
         if shot is not None:
-            image_bytes, source_key = shot.getvalue(), f"camera-{shot.file_id}"
-        elif uploaded is not None:
-            image_bytes, source_key = uploaded.getvalue(), f"upload-{uploaded.file_id}"
-        elif sample_choice:
+            available["camera"] = (shot.getvalue(), f"camera-{shot.file_id}")
+        if uploaded is not None:
+            available["upload"] = (uploaded.getvalue(), f"upload-{uploaded.file_id}")
+        if sample_choice:
             sample = next(s for s in samples if s.title == sample_choice)
-            image_bytes, source_key = sample.path.read_bytes(), f"sample-{sample.id}"
+            available["sample"] = (sample.path.read_bytes(), f"sample-{sample.id}")
+        last = st.session_state.get("last_source")
+        for source in [last, "camera", "upload", "sample"]:
+            if source in available:
+                image_bytes, source_key = available[source]
+                break
     else:
         sample_choice = st.radio("選一張範例照片", [s.title for s in samples], index=None, horizontal=True)
         if sample_choice:
